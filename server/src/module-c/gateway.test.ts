@@ -150,6 +150,58 @@ test("room:reconnect 必须与握手鉴权玩家一致", async () => {
   }
 });
 
+test("会话接管后，旧连接断开不会把玩家重新标记为 OFFLINE", async () => {
+  const runtime = await bootstrapGateway(0);
+  const baseUrl = `http://127.0.0.1:${runtime.port}`;
+  const originalP1 = await connectClient(baseUrl, "p1");
+  const p2 = await connectClient(baseUrl, "p2");
+  const clients: ClientHandle[] = [originalP1, p2];
+
+  try {
+    const created = onceEvent<{ roomId: string }>(originalP1.socket, "room:sync");
+    originalP1.socket.emit("room:create", { gameId: "gobang", playerId: originalP1.playerId });
+    const { roomId } = await created;
+
+    const joined = onceEvent<{ roomId: string }>(p2.socket, "room:sync");
+    p2.socket.emit("room:join", { roomId, playerId: p2.playerId });
+    await joined;
+
+    originalP1.socket.emit("game:ready");
+    p2.socket.emit("game:ready");
+    await Promise.all([onceEvent(originalP1.socket, "game:start"), onceEvent(p2.socket, "game:start")]);
+
+    const roomSyncEvents: Array<Array<{ playerId: string; presence: string }>> = [];
+    p2.socket.on("room:sync", (payload: { players: Array<{ playerId: string; presence: string }> }) => {
+      roomSyncEvents.push(payload.players);
+    });
+
+    const replacement = await connectClient(baseUrl, "p1");
+    clients.push(replacement);
+
+    try {
+      const syncFull = onceEvent<{ roomId: string; stateVersion: number }>(replacement.socket, "game:sync_full");
+      const roomSync = onceEvent<{ players: Array<{ playerId: string; presence: string }> }>(p2.socket, "room:sync");
+      replacement.socket.emit("room:reconnect", { roomId, playerId: "p1" });
+
+      const [full, onlineState] = await Promise.all([syncFull, roomSync]);
+      assert.equal(full.roomId, roomId);
+      assert.equal(onlineState.players.find((player) => player.playerId === "p1")?.presence, "ONLINE");
+
+      await delay(150);
+      assert.equal(
+        roomSyncEvents.some((players) => players.find((player) => player.playerId === "p1")?.presence === "OFFLINE"),
+        false,
+      );
+    } finally {
+      await closeClients([replacement]);
+      clients.pop();
+    }
+  } finally {
+    await closeClients(clients);
+    await runtime.close();
+  }
+});
+
 test("客户端版本落后时拒绝动作并返回全量同步", async () => {
   const runtime = await bootstrapGateway(0);
   const baseUrl = `http://127.0.0.1:${runtime.port}`;

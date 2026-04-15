@@ -72,6 +72,21 @@ test("玩家离开：room:leave 后人数减少", () => {
   assert.equal(sync.players[0]?.playerId, "u1");
 });
 
+test("重复 join：保持 ready 状态且不推进版本", () => {
+  const engine = new RoomEngine();
+  const roomId = engine.createRoom("dummy", testPlugin);
+  engine.joinRoom(roomId, "u1", "s1");
+  engine.joinRoom(roomId, "u2", "s2");
+  engine.markReady(roomId, "u1");
+
+  const versionBefore = engine.getStateVersion(roomId);
+  const sync = engine.joinRoom(roomId, "u1", "s1");
+
+  assert.equal(sync.players.find((player) => player.playerId === "u1")?.ready, true);
+  assert.equal(sync.stateVersion, versionBefore);
+  assert.equal(engine.getStateVersion(roomId), versionBefore);
+});
+
 test("终局标记：命中 isGameOver 后返回 winners", () => {
   const engine = new RoomEngine();
   const roomId = engine.createRoom("dummy", testPlugin);

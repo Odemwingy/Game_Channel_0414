@@ -1,6 +1,6 @@
 export interface AuthContext {
   playerId: string;
-  token?: string;
+  token: string;
 }
 
 export function validateSocketAuth(input: unknown): AuthContext {
@@ -11,11 +11,11 @@ export function validateSocketAuth(input: unknown): AuthContext {
   if (typeof payload.playerId !== "string" || payload.playerId.length === 0) {
     throw new Error("UNAUTHORIZED");
   }
-  if (payload.token != null && typeof payload.token !== "string") {
+  if (typeof payload.token !== "string" || payload.token.length === 0) {
     throw new Error("UNAUTHORIZED");
   }
-  if (typeof payload.token === "string" && !payload.token.startsWith("dev_")) {
+  if (payload.token !== `dev_${payload.playerId}`) {
     throw new Error("UNAUTHORIZED");
   }
-  return { playerId: payload.playerId, token: payload.token as string | undefined };
+  return { playerId: payload.playerId, token: payload.token };
 }

@@ -44,15 +44,34 @@ export class RoomEngine {
 
   joinRoom(roomId: string, playerId: string, socketId: string): RoomSyncPayload {
     const room = this.mustRoom(roomId);
-    if (room.players.size >= room.plugin.maxPlayers && !room.players.has(playerId)) {
+    const existingPlayer = room.players.get(playerId);
+    if (!existingPlayer && room.players.size >= room.plugin.maxPlayers) {
       throw new Error("ROOM_FULL");
     }
+
+    const now = Date.now();
+    if (existingPlayer) {
+      if (existingPlayer.socketId === socketId && existingPlayer.presence === "ONLINE") {
+        existingPlayer.lastSeenAt = now;
+        return this.sync(room);
+      }
+
+      room.players.set(playerId, {
+        ...existingPlayer,
+        socketId,
+        presence: "ONLINE",
+        lastSeenAt: now,
+      });
+      room.stateVersion += 1;
+      return this.sync(room);
+    }
+
     room.players.set(playerId, {
       playerId,
       socketId,
       presence: "ONLINE",
       ready: false,
-      lastSeenAt: Date.now(),
+      lastSeenAt: now,
     });
     room.stateVersion += 1;
     return this.sync(room);

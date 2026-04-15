@@ -14,6 +14,11 @@ export interface GatewayRuntime {
   close(): Promise<void>;
 }
 
+interface ActiveSession {
+  roomId: string;
+  playerId: string;
+}
+
 function emitScopedView(
   io: Server,
   engine: RoomEngine,
@@ -43,7 +48,33 @@ export async function bootstrapGateway(port = 3001): Promise<GatewayRuntime> {
   registry.register(new DoudizhuPlugin());
   registry.register(new GobangPlugin());
   const engine = new RoomEngine();
-  const session = new Map<string, { roomId: string; playerId: string }>();
+  const session = new Map<string, ActiveSession>();
+
+  function getActiveSession(socketId: string): ActiveSession | null {
+    const current = session.get(socketId);
+    if (!current) {
+      return null;
+    }
+    if (engine.getPlayerSocketId(current.roomId, current.playerId) !== socketId) {
+      session.delete(socketId);
+      return null;
+    }
+    return current;
+  }
+
+  function replaceSocket(previousSocketId: string | null, nextSocketId: string, roomId: string): void {
+    if (!previousSocketId || previousSocketId === nextSocketId) {
+      return;
+    }
+    session.delete(previousSocketId);
+    const previousSocket = io.sockets.sockets.get(previousSocketId);
+    if (!previousSocket) {
+      return;
+    }
+    previousSocket.leave(roomId);
+    previousSocket.emit("game:error", { message: "SESSION_REPLACED" });
+    previousSocket.disconnect(true);
+  }
 
   io.on("connection", (socket) => {
     let authedPlayerId = "";
@@ -78,9 +109,11 @@ export async function bootstrapGateway(port = 3001): Promise<GatewayRuntime> {
     socket.on("room:join", ({ roomId, playerId }: { roomId: string; playerId: string }) => {
       try {
         if (playerId !== authedPlayerId) throw new Error("UNAUTHORIZED");
+        const previousSocketId = engine.getPlayerSocketId(roomId, playerId);
         const sync = engine.joinRoom(roomId, playerId, socket.id);
         socket.join(roomId);
         session.set(socket.id, { roomId, playerId });
+        replaceSocket(previousSocketId, socket.id, roomId);
         io.to(roomId).emit("room:sync", sync);
       } catch (e) {
         writeAuditLog("WARN", {
@@ -94,8 +127,11 @@ export async function bootstrapGateway(port = 3001): Promise<GatewayRuntime> {
     });
 
     socket.on("game:ready", () => {
-      const s = session.get(socket.id);
-      if (!s) return;
+      const s = getActiveSession(socket.id);
+      if (!s) {
+        socket.emit("game:error", { message: "STALE_SESSION" });
+        return;
+      }
       try {
         const sync = engine.markReady(s.roomId, s.playerId);
         io.to(s.roomId).emit("room:sync", sync);
@@ -112,8 +148,11 @@ export async function bootstrapGateway(port = 3001): Promise<GatewayRuntime> {
     });
 
     socket.on("game:action", (action: GameActionEnvelope & { stateVersion?: number }) => {
-      const s = session.get(socket.id);
-      if (!s) return;
+      const s = getActiveSession(socket.id);
+      if (!s) {
+        socket.emit("game:error", { message: "STALE_SESSION" });
+        return;
+      }
       try {
         const currentVersion = engine.getStateVersion(s.roomId);
         if (typeof action.stateVersion === "number" && action.stateVersion < currentVersion) {
@@ -172,8 +211,11 @@ export async function bootstrapGateway(port = 3001): Promise<GatewayRuntime> {
     });
 
     socket.on("room:sync_full", () => {
-      const s = session.get(socket.id);
-      if (!s) return;
+      const s = getActiveSession(socket.id);
+      if (!s) {
+        socket.emit("game:error", { message: "STALE_SESSION" });
+        return;
+      }
       try {
         const sync = engine.getSnapshot(s.roomId);
         socket.emit("game:sync_full", {
@@ -187,8 +229,11 @@ export async function bootstrapGateway(port = 3001): Promise<GatewayRuntime> {
     });
 
     socket.on("room:leave", () => {
-      const s = session.get(socket.id);
-      if (!s) return;
+      const s = getActiveSession(socket.id);
+      if (!s) {
+        socket.emit("game:error", { message: "STALE_SESSION" });
+        return;
+      }
       try {
         const sync = engine.leaveRoom(s.roomId, s.playerId);
         socket.leave(s.roomId);
@@ -202,9 +247,11 @@ export async function bootstrapGateway(port = 3001): Promise<GatewayRuntime> {
     socket.on("room:reconnect", ({ roomId, playerId }: { roomId: string; playerId: string }) => {
       try {
         if (playerId !== authedPlayerId) throw new Error("UNAUTHORIZED");
+        const previousSocketId = engine.getPlayerSocketId(roomId, playerId);
         const sync = engine.reconnect(roomId, playerId, socket.id);
         socket.join(roomId);
         session.set(socket.id, { roomId, playerId });
+        replaceSocket(previousSocketId, socket.id, roomId);
         socket.emit("game:sync_full", { roomId, stateVersion: sync.stateVersion, view: engine.getPlayerView(roomId, playerId) });
         io.to(roomId).emit("room:sync", sync);
       } catch (e) {
@@ -222,6 +269,9 @@ export async function bootstrapGateway(port = 3001): Promise<GatewayRuntime> {
       const s = session.get(socket.id);
       if (!s) return;
       session.delete(socket.id);
+      if (engine.getPlayerSocketId(s.roomId, s.playerId) !== socket.id) {
+        return;
+      }
       try {
         io.to(s.roomId).emit("room:sync", engine.markOffline(s.roomId, s.playerId));
         writeAuditLog("INFO", { event: "player_offline", roomId: s.roomId, playerId: s.playerId });
