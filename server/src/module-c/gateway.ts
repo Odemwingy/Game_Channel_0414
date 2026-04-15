@@ -3,6 +3,7 @@ import { Server } from "socket.io";
 import { PluginRegistry } from "./core/plugin.js";
 import { RoomEngine } from "./core/room-engine.js";
 import { validateSocketAuth } from "./core/auth.js";
+import { writeAuditLog } from "./core/audit-log.js";
 import { DoudizhuPlugin } from "./plugins/doudizhu-plugin.js";
 import { GobangPlugin } from "./plugins/gobang-plugin.js";
 import type { GameActionEnvelope } from "./protocol/types.js";
@@ -26,6 +27,7 @@ export function bootstrapGateway(port = 3001): void {
       const auth = validateSocketAuth(socket.handshake.auth);
       authedPlayerId = auth.playerId;
     } catch (e) {
+      writeAuditLog("WARN", { event: "auth_failed", detail: { reason: String(e) } });
       socket.emit("game:error", { message: String(e) });
       socket.disconnect();
       return;
@@ -40,6 +42,11 @@ export function bootstrapGateway(port = 3001): void {
         session.set(socket.id, { roomId, playerId });
         io.to(roomId).emit("room:sync", sync);
       } catch (e) {
+        writeAuditLog("WARN", {
+          event: "room_create_failed",
+          playerId,
+          detail: { gameId, reason: String(e) },
+        });
         socket.emit("game:error", { message: String(e) });
       }
     });
@@ -52,6 +59,12 @@ export function bootstrapGateway(port = 3001): void {
         session.set(socket.id, { roomId, playerId });
         io.to(roomId).emit("room:sync", sync);
       } catch (e) {
+        writeAuditLog("WARN", {
+          event: "room_join_failed",
+          roomId,
+          playerId,
+          detail: { reason: String(e) },
+        });
         socket.emit("game:error", { message: String(e) });
       }
     });
@@ -77,12 +90,33 @@ export function bootstrapGateway(port = 3001): void {
       }
     });
 
-    socket.on("game:action", (action: GameActionEnvelope) => {
+    socket.on("game:action", (action: GameActionEnvelope & { stateVersion?: number }) => {
       const s = session.get(socket.id);
       if (!s) return;
       try {
+        const currentVersion = engine.getStateVersion(s.roomId);
+        if (typeof action.stateVersion === "number" && action.stateVersion < currentVersion) {
+          writeAuditLog("INFO", {
+            event: "stale_action_rejected",
+            roomId: s.roomId,
+            playerId: s.playerId,
+            detail: { actionId: action.actionId, clientVersion: action.stateVersion, serverVersion: currentVersion },
+          });
+          socket.emit("game:sync_full", {
+            roomId: s.roomId,
+            stateVersion: currentVersion,
+            view: engine.getPlayerView(s.roomId, s.playerId),
+          });
+          return;
+        }
         const out = engine.handleAction(s.roomId, s.playerId, action);
         if (!out.accepted) {
+          writeAuditLog("WARN", {
+            event: "action_rejected",
+            roomId: s.roomId,
+            playerId: s.playerId,
+            detail: { actionId: action.actionId, reason: out.error },
+          });
           socket.emit("game:error", { message: out.error, stateVersion: out.version });
           return;
         }
@@ -97,12 +131,38 @@ export function bootstrapGateway(port = 3001): void {
           });
         }
         if (out.gameOver) {
+          writeAuditLog("INFO", {
+            event: "game_over",
+            roomId: s.roomId,
+            detail: { winners: out.gameOver.winners ?? [] },
+          });
           io.to(s.roomId).emit("game:over", {
             roomId: s.roomId,
             winners: out.gameOver.winners ?? [],
             stateVersion: out.version,
           });
         }
+      } catch (e) {
+        writeAuditLog("ERROR", {
+          event: "action_failed",
+          roomId: s.roomId,
+          playerId: s.playerId,
+          detail: { reason: String(e) },
+        });
+        socket.emit("game:error", { message: String(e) });
+      }
+    });
+
+    socket.on("room:sync_full", () => {
+      const s = session.get(socket.id);
+      if (!s) return;
+      try {
+        const sync = engine.getSnapshot(s.roomId);
+        socket.emit("game:sync_full", {
+          roomId: s.roomId,
+          stateVersion: sync.stateVersion,
+          view: engine.getPlayerView(s.roomId, s.playerId),
+        });
       } catch (e) {
         socket.emit("game:error", { message: String(e) });
       }
@@ -129,6 +189,12 @@ export function bootstrapGateway(port = 3001): void {
         socket.emit("game:sync_full", { roomId, stateVersion: sync.stateVersion, view: engine.getPlayerView(roomId, playerId) });
         io.to(roomId).emit("room:sync", sync);
       } catch (e) {
+        writeAuditLog("WARN", {
+          event: "reconnect_failed",
+          roomId,
+          playerId,
+          detail: { reason: String(e) },
+        });
         socket.emit("game:error", { message: String(e) });
       }
     });
@@ -139,6 +205,7 @@ export function bootstrapGateway(port = 3001): void {
       session.delete(socket.id);
       try {
         io.to(s.roomId).emit("room:sync", engine.markOffline(s.roomId, s.playerId));
+        writeAuditLog("INFO", { event: "player_offline", roomId: s.roomId, playerId: s.playerId });
       } catch {
         // ignore
       }

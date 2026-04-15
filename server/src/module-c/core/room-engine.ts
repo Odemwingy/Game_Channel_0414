@@ -17,6 +17,7 @@ export interface ActionOutcome {
   accepted: boolean;
   error?: string;
   version: number;
+  currentVersion?: number;
   gameOver?: {
     winners?: string[];
   };
@@ -107,6 +108,10 @@ export class RoomEngine {
     };
     room.dedup.set(key, accepted);
     return accepted;
+  }
+
+  getStateVersion(roomId: string): number {
+    return this.mustRoom(roomId).stateVersion;
   }
 
   markOffline(roomId: string, playerId: string): RoomSyncPayload {
