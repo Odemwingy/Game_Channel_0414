@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { Server } from "socket.io";
 import { PluginRegistry } from "./core/plugin.js";
 import { RoomEngine } from "./core/room-engine.js";
@@ -8,7 +9,30 @@ import { DoudizhuPlugin } from "./plugins/doudizhu-plugin.js";
 import { GobangPlugin } from "./plugins/gobang-plugin.js";
 import type { GameActionEnvelope } from "./protocol/types.js";
 
-export function bootstrapGateway(port = 3001): void {
+export interface GatewayRuntime {
+  port: number;
+  close(): Promise<void>;
+}
+
+function emitScopedView(
+  io: Server,
+  engine: RoomEngine,
+  roomId: string,
+  playerId: string,
+  event: "game:start" | "game:update",
+  payload: Record<string, unknown>,
+): void {
+  const socketId = engine.getPlayerSocketId(roomId, playerId);
+  if (!socketId) return;
+  io.to(socketId).emit(event, {
+    roomId,
+    playerId,
+    view: engine.getPlayerView(roomId, playerId),
+    ...payload,
+  });
+}
+
+export async function bootstrapGateway(port = 3001): Promise<GatewayRuntime> {
   const httpServer = createServer();
   const io = new Server(httpServer, {
     cors: { origin: "*" },
@@ -77,10 +101,7 @@ export function bootstrapGateway(port = 3001): void {
         io.to(s.roomId).emit("room:sync", sync);
         if (sync.state === "PLAYING") {
           for (const p of sync.players) {
-            io.to(s.roomId).emit("game:start", {
-              roomId: s.roomId,
-              playerId: p.playerId,
-              view: engine.getPlayerView(s.roomId, p.playerId),
+            emitScopedView(io, engine, s.roomId, p.playerId, "game:start", {
               stateVersion: sync.stateVersion,
             });
           }
@@ -122,10 +143,7 @@ export function bootstrapGateway(port = 3001): void {
         }
         const sync = engine.getSnapshot(s.roomId);
         for (const p of sync.players) {
-          io.to(s.roomId).emit("game:update", {
-            roomId: s.roomId,
-            playerId: p.playerId,
-            view: engine.getPlayerView(s.roomId, p.playerId),
+          emitScopedView(io, engine, s.roomId, p.playerId, "game:update", {
             stateVersion: sync.stateVersion,
             lastAction: action,
           });
@@ -183,6 +201,7 @@ export function bootstrapGateway(port = 3001): void {
 
     socket.on("room:reconnect", ({ roomId, playerId }: { roomId: string; playerId: string }) => {
       try {
+        if (playerId !== authedPlayerId) throw new Error("UNAUTHORIZED");
         const sync = engine.reconnect(roomId, playerId, socket.id);
         socket.join(roomId);
         session.set(socket.id, { roomId, playerId });
@@ -212,6 +231,30 @@ export function bootstrapGateway(port = 3001): void {
     });
   });
 
-  setInterval(() => engine.tickOfflineFallback(), 5000);
-  httpServer.listen(port, () => console.log(`[module-c] ws gateway on :${port}`));
+  const offlineTicker = setInterval(() => engine.tickOfflineFallback(), 5000);
+  await new Promise<void>((resolve) => {
+    httpServer.listen(port, () => {
+      const address = httpServer.address() as AddressInfo | null;
+      const listenPort = address?.port ?? port;
+      console.log(`[module-c] ws gateway on :${listenPort}`);
+      resolve();
+    });
+  });
+
+  const address = httpServer.address() as AddressInfo | null;
+  return {
+    port: address?.port ?? port,
+    close: async () => {
+      clearInterval(offlineTicker);
+      await new Promise<void>((resolve, reject) => {
+        io.close((error) => {
+          if (error) {
+            reject(error);
+          } else {
+            resolve();
+          }
+        });
+      });
+    },
+  };
 }

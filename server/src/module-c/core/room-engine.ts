@@ -141,6 +141,11 @@ export class RoomEngine {
     return room.plugin.getPlayerView(room.gameState, playerId);
   }
 
+  getPlayerSocketId(roomId: string, playerId: string): string | null {
+    const room = this.mustRoom(roomId);
+    return room.players.get(playerId)?.socketId ?? null;
+  }
+
   getSnapshot(roomId: string): RoomSyncPayload {
     return this.sync(this.mustRoom(roomId));
   }

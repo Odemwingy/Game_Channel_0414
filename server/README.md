@@ -5,12 +5,14 @@
 - RoomEngine（状态机、幂等、断线托管）
 - PluginRegistry
 - 示例插件：`doudizhu`（权威）、`gobang`（校验）
+- 玩家视角按 `socket` 定向下发，避免隐藏信息广播泄漏
 
 ## 运行
 
 ```bash
 npm install
 npm run dev
+npm test
 ```
 
 默认端口 `3001`，可通过 `WS_PORT` 修改。
