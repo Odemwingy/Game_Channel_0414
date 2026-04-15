@@ -84,3 +84,41 @@ test("终局标记：命中 isGameOver 后返回 winners", () => {
   assert.equal(result.accepted, true);
   assert.deepEqual(result.gameOver?.winners, ["u1"]);
 });
+
+test("非法动作：拒绝处理且不推进版本", () => {
+  const engine = new RoomEngine();
+  const roomId = engine.createRoom("dummy", testPlugin);
+  engine.joinRoom(roomId, "u1", "s1");
+  engine.joinRoom(roomId, "u2", "s2");
+  engine.markReady(roomId, "u1");
+  engine.markReady(roomId, "u2");
+
+  const versionBefore = engine.getStateVersion(roomId);
+  const result = engine.handleAction(roomId, "u2", action("wrong-turn"));
+
+  assert.equal(result.accepted, false);
+  assert.equal(result.error, "NOT_YOUR_TURN");
+  assert.equal(result.version, versionBefore);
+  assert.equal(engine.getStateVersion(roomId), versionBefore);
+});
+
+test("断线托管：超过保留时长后执行 fallbackAction", () => {
+  const engine = new RoomEngine();
+  const roomId = engine.createRoom("dummy", {
+    ...testPlugin,
+    fallbackAction() {
+      return { actionId: "fallback-1", type: "STEP", payload: {}, clientTs: Date.now() };
+    },
+  });
+  engine.joinRoom(roomId, "u1", "s1");
+  engine.joinRoom(roomId, "u2", "s2");
+  engine.markReady(roomId, "u1");
+  engine.markReady(roomId, "u2");
+
+  const versionBefore = engine.getStateVersion(roomId);
+  engine.markOffline(roomId, "u1");
+  engine.tickOfflineFallback(Date.now() + 121_000);
+
+  assert.equal(engine.getStateVersion(roomId), versionBefore + 2);
+  assert.equal(engine.getSnapshot(roomId).state, "SETTLED");
+});
