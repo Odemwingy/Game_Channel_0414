@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Runtime data
+*.sqlite
+*.sqlite3
+*.db
+data/
+tmp/
+
+# Exports
+exports/
+
+# Environment
+.env
+.env.*
+
+# Node
+node_modules/
+dist/
+coverage/
