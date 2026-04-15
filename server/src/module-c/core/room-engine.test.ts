@@ -87,6 +87,20 @@ test("重复 join：保持 ready 状态且不推进版本", () => {
   assert.equal(engine.getStateVersion(roomId), versionBefore);
 });
 
+test("重复 ready：不重复推进版本", () => {
+  const engine = new RoomEngine();
+  const roomId = engine.createRoom("dummy", testPlugin);
+  engine.joinRoom(roomId, "u1", "s1");
+  engine.joinRoom(roomId, "u2", "s2");
+
+  engine.markReady(roomId, "u1");
+  const versionBefore = engine.getStateVersion(roomId);
+  const sync = engine.markReady(roomId, "u1");
+
+  assert.equal(sync.players.find((player) => player.playerId === "u1")?.ready, true);
+  assert.equal(sync.stateVersion, versionBefore);
+});
+
 test("终局标记：命中 isGameOver 后返回 winners", () => {
   const engine = new RoomEngine();
   const roomId = engine.createRoom("dummy", testPlugin);
@@ -98,6 +112,26 @@ test("终局标记：命中 isGameOver 后返回 winners", () => {
   const result = engine.handleAction(roomId, "u1", action("a2"));
   assert.equal(result.accepted, true);
   assert.deepEqual(result.gameOver?.winners, ["u1"]);
+  assert.equal(engine.getSnapshot(roomId).players.every((player) => player.ready === false), true);
+});
+
+test("结算后可重新 ready 开启下一局", () => {
+  const engine = new RoomEngine();
+  const roomId = engine.createRoom("dummy", testPlugin);
+  engine.joinRoom(roomId, "u1", "s1");
+  engine.joinRoom(roomId, "u2", "s2");
+  engine.markReady(roomId, "u1");
+  engine.markReady(roomId, "u2");
+  engine.handleAction(roomId, "u1", action("round-1"));
+
+  const afterFirstReady = engine.markReady(roomId, "u1");
+  assert.equal(afterFirstReady.state, "WAITING");
+  assert.equal(afterFirstReady.players.find((player) => player.playerId === "u1")?.ready, true);
+  assert.equal(afterFirstReady.players.find((player) => player.playerId === "u2")?.ready, false);
+
+  const restarted = engine.markReady(roomId, "u2");
+  assert.equal(restarted.state, "PLAYING");
+  assert.equal(engine.getPlayerView(roomId, "u1") != null, true);
 });
 
 test("非法动作：拒绝处理且不推进版本", () => {

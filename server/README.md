@@ -6,6 +6,8 @@
 - PluginRegistry
 - 示例插件：`doudizhu`（权威，可完成最小手牌结算）、`gobang`（校验，可完成五连子结算）
 - 玩家视角按 `socket` 定向下发，避免隐藏信息广播泄漏
+- 最小客户端 SDK：`server/src/sdk/`
+- 服务端插件模板：`server/src/module-c/templates/plugin-template.ts`
 
 ## 运行
 

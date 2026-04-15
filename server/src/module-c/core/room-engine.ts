@@ -91,6 +91,16 @@ export class RoomEngine {
     const room = this.mustRoom(roomId);
     const p = room.players.get(playerId);
     if (!p) throw new Error("PLAYER_NOT_IN_ROOM");
+
+    if (room.state === "PLAYING" || p.ready) {
+      return this.sync(room);
+    }
+
+    if (room.state === "SETTLED") {
+      room.state = "WAITING";
+      room.gameState = null;
+    }
+
     p.ready = true;
     if (room.state === "WAITING" && room.players.size >= room.plugin.minPlayers && [...room.players.values()].every((x) => x.ready)) {
       room.state = "PLAYING";
@@ -119,7 +129,12 @@ export class RoomEngine {
     room.gameState = result.newState;
     room.stateVersion += 1;
     const overResult = room.plugin.isGameOver(room.gameState);
-    if (overResult.isOver) room.state = "SETTLED";
+    if (overResult.isOver) {
+      room.state = "SETTLED";
+      for (const player of room.players.values()) {
+        player.ready = false;
+      }
+    }
     const accepted = {
       accepted: true,
       version: room.stateVersion,
@@ -192,7 +207,12 @@ export class RoomEngine {
       gameId: room.gameId,
       state: room.state,
       stateVersion: room.stateVersion,
-      players: [...room.players.values()].map((p) => ({ playerId: p.playerId, presence: p.presence, ready: p.ready })),
+      players: [...room.players.values()].map((p, seatIndex) => ({
+        playerId: p.playerId,
+        seatIndex,
+        presence: p.presence,
+        ready: p.ready,
+      })),
     };
   }
 }
