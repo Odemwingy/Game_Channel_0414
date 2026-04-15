@@ -49,6 +49,14 @@ export async function bootstrapApiServer(port = 3000): Promise<ApiServerRuntime>
         });
         return;
       }
+      if (error instanceof ForbiddenError) {
+        writeError(res, 403, {
+          code: error.code,
+          message: error.message,
+          requestId,
+        });
+        return;
+      }
       if (error instanceof NotFoundError) {
         writeError(res, 404, {
           code: error.code,
@@ -161,14 +169,81 @@ async function handleRequest(
     if (!isRecord(body) || typeof body.memberNo !== "string" || body.memberNo.trim().length < 4) {
       throw new ValidationError("memberNo is invalid");
     }
-    const user = store.bindMember(authContext.userId!, body.memberNo);
-    if (!user) {
+    const bound = store.bindMember(authContext.userId!, body.memberNo);
+    if (!bound) {
       throw new NotFoundError("USER_NOT_FOUND", "USER_NOT_FOUND");
     }
     writeJson(res, 200, {
       data: {
-        userId: user.id,
-        memberMasked: user.memberMasked,
+        userId: bound.user.id,
+        memberMasked: bound.user.memberMasked,
+        points: bound.user.points,
+        bonus: {
+          amount: bound.bonusLog.amount,
+          idempotent: bound.bonusIdempotent,
+          capped: bound.bonusLog.capped,
+          reason: bound.bonusLog.reason,
+          sessionId: bound.bonusLog.sessionId,
+          createdAt: bound.bonusLog.createdAt,
+        },
+      },
+      requestId: authContext.requestId,
+    });
+    return;
+  }
+
+  if (method === "GET" && path === "/api/v1/points/rules") {
+    writeJson(res, 200, { data: store.getPointRules(), requestId: authContext.requestId });
+    return;
+  }
+
+  if (method === "GET" && path === "/api/v1/points/history") {
+    const limitRaw = url.searchParams.get("limit");
+    const limit = limitRaw ? Number(limitRaw) : 50;
+    if (!Number.isFinite(limit) || limit <= 0) {
+      throw new ValidationError("limit must be a positive number");
+    }
+    writeJson(res, 200, {
+      data: store.getPointHistory(authContext.userId!, limit),
+      requestId: authContext.requestId,
+    });
+    return;
+  }
+
+  if (method === "POST" && path === "/api/v1/points/settle") {
+    const body = await readJsonBody(req);
+    if (!isRecord(body) || typeof body.sessionId !== "string" || typeof body.reason !== "string") {
+      throw new ValidationError("sessionId and reason are required");
+    }
+    if (body.sessionId.trim().length === 0 || body.reason.trim().length === 0) {
+      throw new ValidationError("sessionId and reason are required");
+    }
+    if (body.amount !== undefined && (typeof body.amount !== "number" || !Number.isFinite(body.amount))) {
+      throw new ValidationError("amount must be a number");
+    }
+    const reasonRule = store.getPointReason(body.reason);
+    if (!reasonRule) {
+      throw new ValidationError("reason is invalid");
+    }
+    if (reasonRule.adminOnly && !isAdminUser(authContext.userId!)) {
+      throw new ForbiddenError("FORBIDDEN", "reason requires admin role");
+    }
+    const user = store.getUserProfile(authContext.userId!);
+    if (!user) {
+      throw new NotFoundError("USER_NOT_FOUND", "USER_NOT_FOUND");
+    }
+    const result = store.settlePoints({
+      userId: user.id,
+      sessionId: body.sessionId,
+      reason: body.reason,
+      amount: typeof body.amount === "number" ? body.amount : undefined,
+    });
+    writeJson(res, 200, {
+      data: {
+        userId: result.user.id,
+        points: result.user.points,
+        idempotent: result.idempotent,
+        log: result.log,
       },
       requestId: authContext.requestId,
     });
@@ -291,6 +366,48 @@ async function handleRequest(
     return;
   }
 
+  if (method === "POST" && path === "/api/v1/admin/points/grant") {
+    if (!isAdminUser(authContext.userId!)) {
+      throw new ForbiddenError("FORBIDDEN", "admin role required");
+    }
+    const body = await readJsonBody(req);
+    if (!isRecord(body) || typeof body.userId !== "string" || typeof body.amount !== "number") {
+      throw new ValidationError("userId and amount are required");
+    }
+    if (body.userId.trim().length === 0 || !Number.isFinite(body.amount) || body.amount < 0) {
+      throw new ValidationError("userId and amount are invalid");
+    }
+    const user = store.getUserProfile(body.userId);
+    if (!user) {
+      throw new NotFoundError("USER_NOT_FOUND", "USER_NOT_FOUND");
+    }
+    const reason = typeof body.reason === "string" && body.reason.trim().length > 0 ? body.reason : "OPS_GRANT";
+    const reasonRule = store.getPointReason(reason);
+    if (!reasonRule) {
+      throw new ValidationError("reason is invalid");
+    }
+    const sessionId =
+      typeof body.sessionId === "string" && body.sessionId.trim().length > 0
+        ? body.sessionId
+        : `ops-grant:${Date.now()}:${body.userId}`;
+    const result = store.settlePoints({
+      userId: user.id,
+      sessionId,
+      reason,
+      amount: body.amount,
+    });
+    writeJson(res, 200, {
+      data: {
+        userId: result.user.id,
+        points: result.user.points,
+        idempotent: result.idempotent,
+        log: result.log,
+      },
+      requestId: authContext.requestId,
+    });
+    return;
+  }
+
   throw new NotFoundError("NOT_FOUND", "ROUTE_NOT_FOUND");
 }
 
@@ -369,11 +486,24 @@ function getRemoteAddress(socket: Socket): string {
   return socket.remoteAddress ?? "unknown";
 }
 
+function isAdminUser(userId: string): boolean {
+  return userId === "admin";
+}
+
 class JsonBodyParseError extends Error {}
 
 class ValidationError extends Error {}
 
 class ConflictError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+class ForbiddenError extends Error {
   constructor(
     readonly code: string,
     message: string,

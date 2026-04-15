@@ -1,0 +1,27 @@
+{
+  "version": "2026.04.1",
+  "caps": {
+    "perSession": 200,
+    "perDay": 500,
+    "perFlight": 1200
+  },
+  "reasons": {
+    "GAME_PLAY": {
+      "description": "完成一局对局",
+      "points": 20
+    },
+    "GAME_WIN": {
+      "description": "获胜奖励",
+      "points": 50
+    },
+    "MEMBER_BIND_BONUS": {
+      "description": "会员绑定奖励",
+      "points": 100
+    },
+    "OPS_GRANT": {
+      "description": "运营补发",
+      "points": 0,
+      "adminOnly": true
+    }
+  }
+}

@@ -1,10 +1,88 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { ExportBatchRecord, FlightInfo, RoomRecord, UserRecord } from "./types.js";
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
+import type {
+  ExportBatchRecord,
+  FlightInfo,
+  PointLogRecord,
+  PointReasonRule,
+  PointsCaps,
+  PointsRulesSnapshot,
+  RoomRecord,
+  UserRecord,
+} from "./types.js";
 
 interface RateBucket {
   windowStartMs: number;
   count: number;
 }
+
+interface SettlePointsPayload {
+  userId: string;
+  sessionId: string;
+  reason: string;
+  amount?: number;
+  createdAt?: string;
+}
+
+interface SettlePointsResult {
+  user: UserRecord;
+  log: PointLogRecord;
+  idempotent: boolean;
+}
+
+interface RawReasonRule {
+  description?: unknown;
+  points?: unknown;
+  adminOnly?: unknown;
+}
+
+interface RawPointsRulesFile {
+  version?: unknown;
+  caps?: {
+    perSession?: unknown;
+    perDay?: unknown;
+    perFlight?: unknown;
+  };
+  reasons?: Record<string, RawReasonRule>;
+}
+
+interface LoadedPointsRules {
+  snapshot: PointsRulesSnapshot;
+  reasonMap: Map<string, PointReasonRule>;
+}
+
+const DEFAULT_POINTS_RULES = {
+  version: "2026.04.1",
+  caps: {
+    perSession: 200,
+    perDay: 500,
+    perFlight: 1200,
+  },
+  reasons: [
+    {
+      reason: "GAME_PLAY",
+      description: "完成一局对局",
+      points: 20,
+    },
+    {
+      reason: "GAME_WIN",
+      description: "获胜奖励",
+      points: 50,
+    },
+    {
+      reason: "MEMBER_BIND_BONUS",
+      description: "会员绑定奖励",
+      points: 100,
+    },
+    {
+      reason: "OPS_GRANT",
+      description: "运营补发",
+      points: 0,
+      adminOnly: true,
+    },
+  ] satisfies PointReasonRule[],
+};
 
 export class InMemoryStore {
   private readonly users = new Map<string, UserRecord>();
@@ -12,6 +90,10 @@ export class InMemoryStore {
   private readonly rooms = new Map<string, RoomRecord>();
   private readonly exportBatches = new Map<string, ExportBatchRecord>();
   private readonly rateLimitBuckets = new Map<string, RateBucket>();
+  private readonly pointLogs = new Map<string, PointLogRecord>();
+  private readonly pointDedup = new Map<string, string>();
+  private readonly pointsRules: PointsRulesSnapshot;
+  private readonly pointReasons: Map<string, PointReasonRule>;
 
   private flightInfo: FlightInfo = {
     id: "flight-default",
@@ -23,6 +105,12 @@ export class InMemoryStore {
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
+
+  constructor() {
+    const loaded = loadPointsRules();
+    this.pointsRules = loaded.snapshot;
+    this.pointReasons = loaded.reasonMap;
+  }
 
   registerUser(payload: { deviceFp: string; nickname: string; seatNo?: string }): UserRecord {
     const existingId = this.usersByDeviceFp.get(payload.deviceFp);
@@ -49,14 +137,31 @@ export class InMemoryStore {
     return this.users.get(userId) ?? null;
   }
 
-  bindMember(userId: string, memberNo: string): UserRecord | null {
+  bindMember(
+    userId: string,
+    memberNo: string,
+  ): {
+    user: UserRecord;
+    bonusLog: PointLogRecord;
+    bonusIdempotent: boolean;
+  } | null {
     const user = this.users.get(userId);
     if (!user) return null;
 
     const normalized = memberNo.trim().toUpperCase();
     user.memberHash = sha256(normalized);
     user.memberMasked = maskMemberNo(normalized);
-    return user;
+
+    const bonus = this.settlePoints({
+      userId,
+      sessionId: `member-bind:${userId}`,
+      reason: "MEMBER_BIND_BONUS",
+    });
+    return {
+      user,
+      bonusLog: bonus.log,
+      bonusIdempotent: bonus.idempotent,
+    };
   }
 
   createRoom(payload: { gameId: string; ownerUserId: string }): RoomRecord {
@@ -106,6 +211,74 @@ export class InMemoryStore {
 
   getGameDetail(gameId: string): { id: string; name: string; mode: "solo" | "multiplayer" | "both" } | null {
     return this.getGames().find((game) => game.id === gameId) ?? null;
+  }
+
+  getPointRules(): PointsRulesSnapshot {
+    return this.pointsRules;
+  }
+
+  getPointReason(reason: string): PointReasonRule | null {
+    return this.pointReasons.get(reason) ?? null;
+  }
+
+  getPointHistory(userId: string, limit = 50): PointLogRecord[] {
+    const normalizedLimit = Math.min(Math.max(1, Math.floor(limit)), 200);
+    return [...this.pointLogs.values()]
+      .filter((log) => log.userId === userId)
+      .sort((a, b) => Number(new Date(b.createdAt)) - Number(new Date(a.createdAt)))
+      .slice(0, normalizedLimit);
+  }
+
+  settlePoints(payload: SettlePointsPayload): SettlePointsResult {
+    const user = this.users.get(payload.userId);
+    if (!user) {
+      throw new Error("USER_NOT_FOUND");
+    }
+    const reasonRule = this.pointReasons.get(payload.reason);
+    if (!reasonRule) {
+      throw new Error("POINT_REASON_INVALID");
+    }
+    const createdAt = payload.createdAt ?? new Date().toISOString();
+    const dedupKey = `${user.flightId}:${payload.userId}:${payload.sessionId}:${payload.reason}`;
+    const existingLogId = this.pointDedup.get(dedupKey);
+    if (existingLogId) {
+      const existing = this.pointLogs.get(existingLogId);
+      if (existing) {
+        return {
+          user,
+          log: existing,
+          idempotent: true,
+        };
+      }
+      this.pointDedup.delete(dedupKey);
+    }
+
+    const requestedAmount = normalizePoints(payload.amount ?? reasonRule.points);
+    const amount = this.applyPointsCap({
+      user,
+      sessionId: payload.sessionId,
+      requestedAmount,
+      createdAt,
+    });
+    const log: PointLogRecord = {
+      id: randomUUID(),
+      flightId: user.flightId,
+      userId: payload.userId,
+      sessionId: payload.sessionId,
+      reason: payload.reason,
+      amount,
+      ruleVersion: this.pointsRules.version,
+      capped: amount < requestedAmount,
+      createdAt,
+    };
+    this.pointLogs.set(log.id, log);
+    this.pointDedup.set(dedupKey, log.id);
+    user.points += log.amount;
+    return {
+      user,
+      log,
+      idempotent: false,
+    };
   }
 
   initFlight(payload: { id: string; flightNo: string; date: string; departure: string; arrival: string }): FlightInfo {
@@ -191,11 +364,12 @@ export class InMemoryStore {
     return this.flightInfo;
   }
 
-  getStats(): { onlineRooms: number; totalUsers: number; exportBatches: number; flightStatus: string } {
+  getStats(): { onlineRooms: number; totalUsers: number; exportBatches: number; pointLogs: number; flightStatus: string } {
     return {
       onlineRooms: [...this.rooms.values()].filter((room) => room.state !== "DISMISSED").length,
       totalUsers: this.users.size,
       exportBatches: this.exportBatches.size,
+      pointLogs: this.pointLogs.size,
       flightStatus: this.flightInfo.status,
     };
   }
@@ -215,6 +389,132 @@ export class InMemoryStore {
     bucket.count += 1;
     return true;
   }
+
+  private applyPointsCap(payload: {
+    user: UserRecord;
+    sessionId: string;
+    requestedAmount: number;
+    createdAt: string;
+  }): number {
+    if (payload.requestedAmount <= 0) {
+      return 0;
+    }
+    const caps = this.pointsRules.caps;
+    const sessionUsed = this.sumPoints((log) => log.userId === payload.user.id && log.sessionId === payload.sessionId);
+    const dayStart = dayStartIso(payload.createdAt);
+    const dayUsed = this.sumPoints(
+      (log) =>
+        log.userId === payload.user.id &&
+        Number(new Date(log.createdAt)) >= Number(new Date(dayStart)) &&
+        Number(new Date(log.createdAt)) < Number(new Date(dayStart)) + 24 * 60 * 60 * 1000,
+    );
+    const flightUsed = this.sumPoints((log) => log.userId === payload.user.id && log.flightId === payload.user.flightId);
+
+    const amount = Math.min(
+      payload.requestedAmount,
+      Math.max(0, caps.perSession - sessionUsed),
+      Math.max(0, caps.perDay - dayUsed),
+      Math.max(0, caps.perFlight - flightUsed),
+    );
+    return Math.max(0, amount);
+  }
+
+  private sumPoints(filter: (log: PointLogRecord) => boolean): number {
+    let total = 0;
+    for (const log of this.pointLogs.values()) {
+      if (!filter(log)) continue;
+      total += log.amount;
+    }
+    return total;
+  }
+}
+
+function loadPointsRules(): LoadedPointsRules {
+  const candidates = [
+    process.env.POINTS_RULES_PATH,
+    "/app/config/points.json",
+    path.resolve(process.cwd(), "config/points.json"),
+  ].filter((candidate): candidate is string => Boolean(candidate && candidate.trim().length > 0));
+
+  for (const candidate of candidates) {
+    if (!existsSync(candidate)) {
+      continue;
+    }
+    try {
+      const raw = readFileSync(candidate, "utf8");
+      const parsed = JSON.parse(raw) as RawPointsRulesFile;
+      return normalizePointsRules(parsed, candidate);
+    } catch {
+      // ignore invalid file and continue fallback
+    }
+  }
+  return normalizePointsRules({}, "builtin-default");
+}
+
+function normalizePointsRules(raw: RawPointsRulesFile, loadedFrom: string): LoadedPointsRules {
+  const caps: PointsCaps = {
+    perSession: normalizePositiveInt(raw.caps?.perSession, DEFAULT_POINTS_RULES.caps.perSession),
+    perDay: normalizePositiveInt(raw.caps?.perDay, DEFAULT_POINTS_RULES.caps.perDay),
+    perFlight: normalizePositiveInt(raw.caps?.perFlight, DEFAULT_POINTS_RULES.caps.perFlight),
+  };
+  const reasons = normalizeReasons(raw.reasons);
+  const snapshot: PointsRulesSnapshot = {
+    version: typeof raw.version === "string" && raw.version.trim().length > 0 ? raw.version : DEFAULT_POINTS_RULES.version,
+    loadedFrom,
+    caps,
+    reasons,
+  };
+  return {
+    snapshot,
+    reasonMap: new Map(snapshot.reasons.map((reason) => [reason.reason, reason])),
+  };
+}
+
+function normalizeReasons(raw?: Record<string, RawReasonRule>): PointReasonRule[] {
+  if (!raw || typeof raw !== "object") {
+    return [...DEFAULT_POINTS_RULES.reasons];
+  }
+  const normalized: PointReasonRule[] = [];
+  for (const [key, value] of Object.entries(raw)) {
+    if (!value || typeof value !== "object") continue;
+    const reason = key.trim();
+    if (!reason) continue;
+    const points = normalizePoints(value.points);
+    const description =
+      typeof value.description === "string" && value.description.trim().length > 0
+        ? value.description
+        : `${reason} 积分规则`;
+    normalized.push({
+      reason,
+      points,
+      description,
+      adminOnly: Boolean(value.adminOnly),
+    });
+  }
+  if (normalized.length === 0) {
+    return [...DEFAULT_POINTS_RULES.reasons];
+  }
+  return normalized;
+}
+
+function normalizePositiveInt(value: unknown, fallback: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return fallback;
+  }
+  const normalized = Math.floor(value);
+  return normalized > 0 ? normalized : fallback;
+}
+
+function normalizePoints(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return 0;
+  }
+  return Math.max(0, Math.floor(value));
+}
+
+function dayStartIso(value: string): string {
+  const date = new Date(value);
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate())).toISOString();
 }
 
 function sha256(value: string): string {

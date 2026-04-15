@@ -230,3 +230,178 @@ test("非法 JSON 返回标准错误体", async () => {
     assert.equal(response.body.requestId, response.requestId);
   });
 });
+
+test("积分规则与积分流水接口可用，会员绑定自动发放奖励", async () => {
+  await withApiServer(async (baseUrl) => {
+    const registered = await jsonRequest<{ data: { id: string } }>(baseUrl, "/api/v1/user/register", {
+      method: "POST",
+      body: { deviceFp: "device-points-1", nickname: "points-user" },
+    });
+    const userId = registered.body.data.id;
+    const token = `dev_${userId}`;
+
+    const rules = await jsonRequest<{
+      data: {
+        version: string;
+        caps: { perSession: number; perDay: number; perFlight: number };
+        reasons: Array<{ reason: string; points: number }>;
+      };
+    }>(baseUrl, "/api/v1/points/rules", { token });
+    assert.equal(rules.status, 200);
+    assert.equal(typeof rules.body.data.version, "string");
+    assert.equal(rules.body.data.caps.perSession > 0, true);
+    assert.equal(rules.body.data.reasons.some((reason) => reason.reason === "MEMBER_BIND_BONUS"), true);
+
+    const bound = await jsonRequest<{ data: { points: number; bonus: { amount: number; idempotent: boolean } } }>(
+      baseUrl,
+      "/api/v1/user/bind-member",
+      {
+        method: "POST",
+        token,
+        body: { memberNo: "MU99887766" },
+      },
+    );
+    assert.equal(bound.status, 200);
+    assert.equal(bound.body.data.bonus.amount > 0, true);
+    assert.equal(bound.body.data.bonus.idempotent, false);
+    assert.equal(bound.body.data.points > 0, true);
+
+    const history = await jsonRequest<{
+      data: Array<{ reason: string; amount: number; sessionId: string }>;
+    }>(baseUrl, "/api/v1/points/history?limit=10", { token });
+    assert.equal(history.status, 200);
+    assert.equal(history.body.data.length >= 1, true);
+    assert.equal(history.body.data[0]?.reason, "MEMBER_BIND_BONUS");
+    assert.equal(history.body.data[0]?.amount > 0, true);
+    assert.equal(history.body.data[0]?.sessionId.startsWith("member-bind:"), true);
+  });
+});
+
+test("积分入账接口支持幂等与封顶", async () => {
+  await withApiServer(async (baseUrl) => {
+    const registered = await jsonRequest<{ data: { id: string } }>(baseUrl, "/api/v1/user/register", {
+      method: "POST",
+      body: { deviceFp: "device-points-2", nickname: "settle-user" },
+    });
+    const userId = registered.body.data.id;
+    const token = `dev_${userId}`;
+
+    const first = await jsonRequest<{
+      data: { points: number; idempotent: boolean; log: { id: string; amount: number; capped: boolean } };
+    }>(baseUrl, "/api/v1/points/settle", {
+      method: "POST",
+      token,
+      body: {
+        sessionId: "session-idem",
+        reason: "GAME_PLAY",
+        amount: 30,
+      },
+    });
+    assert.equal(first.status, 200);
+    assert.equal(first.body.data.idempotent, false);
+    const firstLogId = first.body.data.log.id;
+    assert.equal(first.body.data.log.amount, 30);
+
+    const second = await jsonRequest<{
+      data: { points: number; idempotent: boolean; log: { id: string; amount: number } };
+    }>(baseUrl, "/api/v1/points/settle", {
+      method: "POST",
+      token,
+      body: {
+        sessionId: "session-idem",
+        reason: "GAME_PLAY",
+        amount: 30,
+      },
+    });
+    assert.equal(second.status, 200);
+    assert.equal(second.body.data.idempotent, true);
+    assert.equal(second.body.data.log.id, firstLogId);
+    assert.equal(second.body.data.points, 30);
+
+    const capFirst = await jsonRequest<{
+      data: { points: number; log: { amount: number; capped: boolean } };
+    }>(baseUrl, "/api/v1/points/settle", {
+      method: "POST",
+      token,
+      body: {
+        sessionId: "session-cap",
+        reason: "GAME_WIN",
+        amount: 180,
+      },
+    });
+    assert.equal(capFirst.status, 200);
+    assert.equal(capFirst.body.data.log.amount, 180);
+    assert.equal(capFirst.body.data.log.capped, false);
+
+    const capSecond = await jsonRequest<{
+      data: { points: number; log: { amount: number; capped: boolean } };
+    }>(baseUrl, "/api/v1/points/settle", {
+      method: "POST",
+      token,
+      body: {
+        sessionId: "session-cap",
+        reason: "GAME_PLAY",
+        amount: 80,
+      },
+    });
+    assert.equal(capSecond.status, 200);
+    assert.equal(capSecond.body.data.log.amount, 20);
+    assert.equal(capSecond.body.data.log.capped, true);
+    assert.equal(capSecond.body.data.points, 230);
+  });
+});
+
+test("运营补发接口仅管理员可调用，且支持幂等", async () => {
+  await withApiServer(async (baseUrl) => {
+    const registered = await jsonRequest<{ data: { id: string } }>(baseUrl, "/api/v1/user/register", {
+      method: "POST",
+      body: { deviceFp: "device-points-3", nickname: "grant-user" },
+    });
+    const userId = registered.body.data.id;
+
+    const forbidden = await jsonRequest<{ code: string }>(baseUrl, "/api/v1/admin/points/grant", {
+      method: "POST",
+      token: `dev_${userId}`,
+      body: {
+        userId,
+        amount: 40,
+        sessionId: "ops-grant-1",
+      },
+    });
+    assert.equal(forbidden.status, 403);
+    assert.equal(forbidden.body.code, "FORBIDDEN");
+
+    const first = await jsonRequest<{
+      data: { points: number; idempotent: boolean; log: { reason: string; amount: number; id: string } };
+    }>(baseUrl, "/api/v1/admin/points/grant", {
+      method: "POST",
+      token: "dev_admin",
+      body: {
+        userId,
+        amount: 40,
+        sessionId: "ops-grant-1",
+      },
+    });
+    assert.equal(first.status, 200);
+    assert.equal(first.body.data.idempotent, false);
+    assert.equal(first.body.data.log.reason, "OPS_GRANT");
+    assert.equal(first.body.data.log.amount, 40);
+    const logId = first.body.data.log.id;
+
+    const second = await jsonRequest<{
+      data: { points: number; idempotent: boolean; log: { id: string } };
+    }>(baseUrl, "/api/v1/admin/points/grant", {
+      method: "POST",
+      token: "dev_admin",
+      body: {
+        userId,
+        amount: 40,
+        sessionId: "ops-grant-1",
+      },
+    });
+    assert.equal(second.status, 200);
+    assert.equal(second.body.data.idempotent, true);
+    assert.equal(second.body.data.log.id, logId);
+    assert.equal(second.body.data.points, 40);
+  });
+});

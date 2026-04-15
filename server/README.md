@@ -1,8 +1,9 @@
-# 模块 B/C 服务开发说明
+# 模块 B/C/D 服务开发说明
 
 当前目录提供两套可并行运行的服务：
 - 模块 B：REST API（用户、房间、航班管理）
 - 模块 C：联机底座（WebSocket Gateway + RoomEngine + Plugin）
+- 模块 D：积分系统（规则、流水、封顶、幂等）
 
 同时提供：
 - 最小客户端 SDK：`server/src/sdk/`
@@ -52,6 +53,15 @@ npm test
 - `GET /api/v1/admin/flight/export`（同航班幂等返回同一批次）
 - `POST /api/v1/admin/flight/reset`
 - `GET /api/v1/admin/stats`
+
+## 模块 D 能力
+
+- 规则加载：`/app/config/points.json`（开发默认 `server/config/points.json`）
+- `GET /api/v1/points/rules`
+- `GET /api/v1/points/history`
+- `POST /api/v1/points/settle`（按 `userId + sessionId + reason` 幂等）
+- `POST /api/v1/admin/points/grant`（管理端补发）
+- 记分封顶：单局、单日、单航班三重封顶，取最小上限生效
 
 ## 模块 C 能力
 
