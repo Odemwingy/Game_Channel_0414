@@ -166,8 +166,22 @@ test("断线托管：超过保留时长后执行 fallbackAction", () => {
 
   const versionBefore = engine.getStateVersion(roomId);
   engine.markOffline(roomId, "u1");
-  engine.tickOfflineFallback(Date.now() + 121_000);
+  const events = engine.tick(Date.now() + 121_000);
 
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.lastAction?.type, "STEP");
   assert.equal(engine.getStateVersion(roomId), versionBefore + 2);
   assert.equal(engine.getSnapshot(roomId).state, "SETTLED");
+});
+
+test("空闲房间：超时后自动解散并回收", () => {
+  const engine = new RoomEngine();
+  const roomId = engine.createRoom("dummy", testPlugin);
+  engine.joinRoom(roomId, "u1", "s1");
+
+  const events = engine.tick(Date.now() + 10 * 60_000 + 1_000);
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.idleDismissed, true);
+  assert.equal(events[0]?.sync.state, "DISMISSED");
+  assert.throws(() => engine.getSnapshot(roomId), /ROOM_NOT_FOUND/);
 });

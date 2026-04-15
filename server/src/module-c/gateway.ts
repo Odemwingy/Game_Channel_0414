@@ -281,7 +281,36 @@ export async function bootstrapGateway(port = 3001): Promise<GatewayRuntime> {
     });
   });
 
-  const offlineTicker = setInterval(() => engine.tickOfflineFallback(), 5000);
+  const offlineTicker = setInterval(() => {
+    const tickEvents = engine.tick();
+    for (const event of tickEvents) {
+      io.to(event.roomId).emit("room:sync", event.sync);
+      if (event.lastAction) {
+        for (const player of event.sync.players) {
+          emitScopedView(io, engine, event.roomId, player.playerId, "game:update", {
+            stateVersion: event.sync.stateVersion,
+            lastAction: event.lastAction,
+          });
+        }
+      }
+      if (event.gameOver) {
+        io.to(event.roomId).emit("game:over", {
+          roomId: event.roomId,
+          winners: event.gameOver.winners ?? [],
+          stateVersion: event.sync.stateVersion,
+        });
+      }
+      if (event.idleDismissed) {
+        for (const [socketId, activeSession] of session.entries()) {
+          if (activeSession.roomId !== event.roomId) continue;
+          session.delete(socketId);
+          const activeSocket = io.sockets.sockets.get(socketId);
+          activeSocket?.leave(event.roomId);
+          activeSocket?.emit("game:error", { message: "ROOM_IDLE_DISMISSED", stateVersion: event.sync.stateVersion });
+        }
+      }
+    }
+  }, 5000);
   await new Promise<void>((resolve) => {
     httpServer.listen(port, () => {
       const address = httpServer.address() as AddressInfo | null;
