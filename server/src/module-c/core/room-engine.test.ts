@@ -185,3 +185,30 @@ test("空闲房间：超时后自动解散并回收", () => {
   assert.equal(events[0]?.sync.state, "DISMISSED");
   assert.throws(() => engine.getSnapshot(roomId), /ROOM_NOT_FOUND/);
 });
+
+test("空房间：建房后无人加入，超时后自动回收", () => {
+  const engine = new RoomEngine();
+  const roomId = engine.createRoom("dummy", testPlugin);
+
+  const events = engine.tick(Date.now() + 10 * 60_000 + 1_000);
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.roomId, roomId);
+  assert.equal(events[0]?.idleDismissed, true);
+  assert.equal(events[0]?.sync.players.length, 0);
+  assert.throws(() => engine.getSnapshot(roomId), /ROOM_NOT_FOUND/);
+});
+
+test("批量空闲房间：超时后全部回收，避免 rooms 持续增长", () => {
+  const engine = new RoomEngine();
+  const roomIds: string[] = [];
+  for (let i = 0; i < 50; i += 1) {
+    roomIds.push(engine.createRoom("dummy", testPlugin));
+  }
+
+  const events = engine.tick(Date.now() + 10 * 60_000 + 1_000);
+  assert.equal(events.length, roomIds.length);
+  assert.equal(events.every((event) => event.idleDismissed === true), true);
+  for (const roomId of roomIds) {
+    assert.throws(() => engine.getSnapshot(roomId), /ROOM_NOT_FOUND/);
+  }
+});
