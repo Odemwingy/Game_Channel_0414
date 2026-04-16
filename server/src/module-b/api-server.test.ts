@@ -219,6 +219,108 @@ test("航班状态机符合 init -> complete -> export(幂等) -> reset", async 
   });
 });
 
+test("航后 reset 会清理航班内缓存数据，避免跨航班残留", async () => {
+  await withApiServer(async (baseUrl) => {
+    const adminToken = "dev_admin";
+    const init = await jsonRequest<{ data: { status: string } }>(baseUrl, "/api/v1/admin/flight/init", {
+      method: "POST",
+      token: adminToken,
+      body: {
+        id: "flight-cleanup-001",
+        flightNo: "MU3001",
+        date: "2026-04-16",
+        departure: "PVG",
+        arrival: "CAN",
+      },
+    });
+    assert.equal(init.status, 200);
+    assert.equal(init.body.data.status, "active");
+
+    const registered = await jsonRequest<{ data: { id: string } }>(baseUrl, "/api/v1/user/register", {
+      method: "POST",
+      body: { deviceFp: "cleanup-device", nickname: "cleanup-user" },
+    });
+    assert.equal(registered.status, 200);
+    const userId = registered.body.data.id;
+    const userToken = `dev_${userId}`;
+
+    const createdRoom = await jsonRequest<{ data: { id: string } }>(baseUrl, "/api/v1/rooms", {
+      method: "POST",
+      token: userToken,
+      body: { gameId: "gobang" },
+    });
+    assert.equal(createdRoom.status, 201);
+
+    const settled = await jsonRequest<{ data: { points: number } }>(baseUrl, "/api/v1/points/settle", {
+      method: "POST",
+      token: userToken,
+      body: {
+        sessionId: "cleanup-session-1",
+        reason: "GAME_PLAY",
+      },
+    });
+    assert.equal(settled.status, 200);
+    assert.equal(settled.body.data.points > 0, true);
+
+    const complete = await jsonRequest<{ data: { status: string } }>(baseUrl, "/api/v1/admin/flight/complete", {
+      method: "POST",
+      token: adminToken,
+    });
+    assert.equal(complete.status, 200);
+    assert.equal(complete.body.data.status, "completed");
+
+    const exported = await jsonRequest<{ data: { id: string } }>(baseUrl, "/api/v1/admin/flight/export", {
+      token: adminToken,
+    });
+    assert.equal(exported.status, 200);
+    assert.equal(typeof exported.body.data.id, "string");
+
+    const beforeResetStats = await jsonRequest<{
+      data: { totalUsers: number; onlineRooms: number; pointLogs: number; exportBatches: number };
+    }>(baseUrl, "/api/v1/admin/stats", {
+      token: adminToken,
+    });
+    assert.equal(beforeResetStats.status, 200);
+    assert.equal(beforeResetStats.body.data.totalUsers >= 1, true);
+    assert.equal(beforeResetStats.body.data.onlineRooms >= 1, true);
+    assert.equal(beforeResetStats.body.data.pointLogs >= 1, true);
+    assert.equal(beforeResetStats.body.data.exportBatches >= 1, true);
+
+    const reset = await jsonRequest<{ data: { status: string } }>(baseUrl, "/api/v1/admin/flight/reset", {
+      method: "POST",
+      token: adminToken,
+    });
+    assert.equal(reset.status, 200);
+    assert.equal(reset.body.data.status, "idle");
+
+    const afterResetStats = await jsonRequest<{
+      data: { totalUsers: number; onlineRooms: number; pointLogs: number; exportBatches: number; flightStatus: string };
+    }>(baseUrl, "/api/v1/admin/stats", {
+      token: adminToken,
+    });
+    assert.equal(afterResetStats.status, 200);
+    assert.equal(afterResetStats.body.data.totalUsers, 0);
+    assert.equal(afterResetStats.body.data.onlineRooms, 0);
+    assert.equal(afterResetStats.body.data.pointLogs, 0);
+    assert.equal(afterResetStats.body.data.exportBatches, 0);
+    assert.equal(afterResetStats.body.data.flightStatus, "idle");
+
+    const oldProfile = await jsonRequest<{ code: string }>(baseUrl, "/api/v1/user/profile", {
+      token: userToken,
+    });
+    assert.equal(oldProfile.status, 404);
+    assert.equal(oldProfile.body.code, "USER_NOT_FOUND");
+
+    const reRegistered = await jsonRequest<{ data: { id: string; points: number } }>(baseUrl, "/api/v1/user/register", {
+      method: "POST",
+      body: { deviceFp: "cleanup-device", nickname: "cleanup-user-restart" },
+    });
+    assert.equal(reRegistered.status, 200);
+    assert.notEqual(reRegistered.body.data.id, userId);
+    assert.equal(reRegistered.body.data.points, 0);
+  });
+});
+
 test("非法 JSON 返回标准错误体", async () => {
   await withApiServer(async (baseUrl) => {
     const response = await jsonRequest<{ code: string; requestId: string }>(baseUrl, "/api/v1/user/register", {

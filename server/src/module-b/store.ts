@@ -351,6 +351,13 @@ export class InMemoryStore {
     if (this.flightInfo.status !== "completed" && this.flightInfo.status !== "exported") {
       throw new Error("FLIGHT_STATE_INVALID");
     }
+    this.users.clear();
+    this.usersByDeviceFp.clear();
+    this.rooms.clear();
+    this.exportBatches.clear();
+    this.pointLogs.clear();
+    this.pointDedup.clear();
+    this.rateLimitBuckets.clear();
     this.flightInfo = {
       id: "flight-default",
       flightNo: "UNKNOWN",
