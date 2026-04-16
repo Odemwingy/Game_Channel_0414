@@ -201,7 +201,7 @@ test("航班状态机符合 init -> complete -> export(幂等) -> reset", async 
       token,
     });
     assert.equal(exported.status, 200);
-    assert.equal(exported.body.data.status, "success");
+    assert.equal(exported.body.data.status, "created");
     const batchId = exported.body.data.id;
 
     const exportedAgain = await jsonRequest<{ data: { id: string } }>(baseUrl, "/api/v1/admin/flight/export", {
@@ -438,6 +438,96 @@ test("航后导出后可按 batchId 查询会员同步数据", async () => {
 
     const missing = await jsonRequest<{ code: string }>(baseUrl, "/api/v1/admin/flight/export/data?batchId=missing", {
       token: adminToken,
+    });
+    assert.equal(missing.status, 404);
+    assert.equal(missing.body.code, "EXPORT_BATCH_NOT_FOUND");
+  });
+});
+
+test("会员同步回写：可更新导出批次状态并查询批次列表", async () => {
+  await withApiServer(async (baseUrl) => {
+    const adminToken = "dev_admin";
+    const init = await jsonRequest<{ data: { status: string } }>(baseUrl, "/api/v1/admin/flight/init", {
+      method: "POST",
+      token: adminToken,
+      body: {
+        id: "flight-member-sync-002",
+        flightNo: "MU3003",
+        date: "2026-04-16",
+        departure: "PVG",
+        arrival: "SZX",
+      },
+    });
+    assert.equal(init.status, 200);
+
+    const complete = await jsonRequest<{ data: { status: string } }>(baseUrl, "/api/v1/admin/flight/complete", {
+      method: "POST",
+      token: adminToken,
+    });
+    assert.equal(complete.status, 200);
+
+    const exported = await jsonRequest<{ data: { id: string; status: string } }>(baseUrl, "/api/v1/admin/flight/export", {
+      token: adminToken,
+    });
+    assert.equal(exported.status, 200);
+    assert.equal(exported.body.data.status, "created");
+    const batchId = exported.body.data.id;
+
+    const reportPartial = await jsonRequest<{
+      data: { id: string; status: string; successCount?: number; failedCount?: number; lastError?: string; syncedAt?: string };
+    }>(baseUrl, "/api/v1/admin/flight/export/report", {
+      method: "POST",
+      token: adminToken,
+      body: {
+        batchId,
+        status: "partial",
+        successCount: 8,
+        failedCount: 2,
+        lastError: "GROUND_API_TIMEOUT",
+      },
+    });
+    assert.equal(reportPartial.status, 200);
+    assert.equal(reportPartial.body.data.id, batchId);
+    assert.equal(reportPartial.body.data.status, "partial");
+    assert.equal(reportPartial.body.data.successCount, 8);
+    assert.equal(reportPartial.body.data.failedCount, 2);
+    assert.equal(reportPartial.body.data.lastError, "GROUND_API_TIMEOUT");
+    assert.equal(typeof reportPartial.body.data.syncedAt, "string");
+
+    const reportSuccess = await jsonRequest<{
+      data: { id: string; status: string; successCount?: number; failedCount?: number; lastError?: string };
+    }>(baseUrl, "/api/v1/admin/flight/export/report", {
+      method: "POST",
+      token: adminToken,
+      body: {
+        batchId,
+        status: "success",
+        successCount: 10,
+        failedCount: 0,
+      },
+    });
+    assert.equal(reportSuccess.status, 200);
+    assert.equal(reportSuccess.body.data.status, "success");
+    assert.equal(reportSuccess.body.data.successCount, 10);
+    assert.equal(reportSuccess.body.data.failedCount, 0);
+    assert.equal(reportSuccess.body.data.lastError, undefined);
+
+    const list = await jsonRequest<{
+      data: Array<{ id: string; flightId: string; status: string; successCount?: number; failedCount?: number }>;
+    }>(baseUrl, "/api/v1/admin/flight/export/batches?flightId=flight-member-sync-002", {
+      token: adminToken,
+    });
+    assert.equal(list.status, 200);
+    assert.equal(list.body.data.length, 1);
+    assert.equal(list.body.data[0]?.id, batchId);
+    assert.equal(list.body.data[0]?.status, "success");
+    assert.equal(list.body.data[0]?.successCount, 10);
+    assert.equal(list.body.data[0]?.failedCount, 0);
+
+    const missing = await jsonRequest<{ code: string }>(baseUrl, "/api/v1/admin/flight/export/report", {
+      method: "POST",
+      token: adminToken,
+      body: { batchId: "missing-batch", status: "failed" },
     });
     assert.equal(missing.status, 404);
     assert.equal(missing.body.code, "EXPORT_BATCH_NOT_FOUND");

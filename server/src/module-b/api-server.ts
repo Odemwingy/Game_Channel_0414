@@ -365,6 +365,46 @@ async function handleRequest(
     return;
   }
 
+  if (method === "GET" && path === "/api/v1/admin/flight/export/batches") {
+    const flightId = url.searchParams.get("flightId") ?? undefined;
+    writeJson(res, 200, { data: store.listExportBatches(flightId), requestId: authContext.requestId });
+    return;
+  }
+
+  if (method === "POST" && path === "/api/v1/admin/flight/export/report") {
+    const body = await readJsonBody(req);
+    if (!isRecord(body) || typeof body.batchId !== "string" || typeof body.status !== "string") {
+      throw new ValidationError("batchId and status are required");
+    }
+    if (body.batchId.trim().length === 0) {
+      throw new ValidationError("batchId is required");
+    }
+    if (body.status !== "success" && body.status !== "failed" && body.status !== "partial") {
+      throw new ValidationError("status must be success|failed|partial");
+    }
+    if (body.successCount !== undefined && (typeof body.successCount !== "number" || !Number.isFinite(body.successCount))) {
+      throw new ValidationError("successCount must be a number");
+    }
+    if (body.failedCount !== undefined && (typeof body.failedCount !== "number" || !Number.isFinite(body.failedCount))) {
+      throw new ValidationError("failedCount must be a number");
+    }
+    if (body.lastError !== undefined && typeof body.lastError !== "string") {
+      throw new ValidationError("lastError must be a string");
+    }
+    const updated = store.reportExportBatch({
+      batchId: body.batchId,
+      status: body.status,
+      successCount: typeof body.successCount === "number" ? body.successCount : undefined,
+      failedCount: typeof body.failedCount === "number" ? body.failedCount : undefined,
+      lastError: typeof body.lastError === "string" ? body.lastError : undefined,
+    });
+    if (!updated) {
+      throw new NotFoundError("EXPORT_BATCH_NOT_FOUND", "EXPORT_BATCH_NOT_FOUND");
+    }
+    writeJson(res, 200, { data: updated, requestId: authContext.requestId });
+    return;
+  }
+
   if (method === "POST" && path === "/api/v1/admin/flight/reset") {
     try {
       writeJson(res, 200, { data: store.resetFlight(), requestId: authContext.requestId });

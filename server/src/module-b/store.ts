@@ -32,6 +32,14 @@ interface SettlePointsResult {
   idempotent: boolean;
 }
 
+interface ReportExportBatchPayload {
+  batchId: string;
+  status: "success" | "failed" | "partial";
+  successCount?: number;
+  failedCount?: number;
+  lastError?: string;
+}
+
 interface RawReasonRule {
   description?: unknown;
   points?: unknown;
@@ -320,9 +328,10 @@ export class InMemoryStore {
       throw new Error("FLIGHT_STATE_INVALID");
     }
 
-    const existing = [...this.exportBatches.values()].find(
-      (batch) => batch.flightId === this.flightInfo.id && batch.status === "success",
-    );
+    const existing = [...this.exportBatches.values()]
+      .filter((batch) => batch.flightId === this.flightInfo.id)
+      .sort((a, b) => Number(new Date(a.createdAt)) - Number(new Date(b.createdAt)))
+      .at(-1);
     if (existing) {
       this.ensureExportPayload(existing);
       this.flightInfo = {
@@ -338,10 +347,11 @@ export class InMemoryStore {
       id: randomUUID(),
       flightId: this.flightInfo.id,
       exportType: "member_credit",
-      status: "success",
+      status: "created",
       filePath: `/app/data/exports/${this.flightInfo.id}.json`,
       checksum: sha256(`${this.flightInfo.id}:${createdAt}`),
       createdAt,
+      updatedAt: createdAt,
     };
     this.exportBatches.set(batch.id, batch);
     this.exportPayloads.set(batch.id, this.buildExportPayload(batch));
@@ -365,6 +375,42 @@ export class InMemoryStore {
     const generated = this.buildExportPayload(batch);
     this.exportPayloads.set(batchId, generated);
     return generated;
+  }
+
+  listExportBatches(flightId?: string): ExportBatchRecord[] {
+    return [...this.exportBatches.values()]
+      .filter((batch) => (flightId ? batch.flightId === flightId : true))
+      .sort((a, b) => Number(new Date(b.createdAt)) - Number(new Date(a.createdAt)));
+  }
+
+  reportExportBatch(payload: ReportExportBatchPayload): ExportBatchRecord | null {
+    const batch = this.exportBatches.get(payload.batchId);
+    if (!batch) {
+      return null;
+    }
+    const nextSuccessCount = payload.successCount ?? batch.successCount;
+    const nextFailedCount = payload.failedCount ?? batch.failedCount;
+    const nextLastError = payload.lastError ?? (payload.status === "success" ? undefined : batch.lastError);
+    if (
+      batch.status === payload.status &&
+      batch.successCount === nextSuccessCount &&
+      batch.failedCount === nextFailedCount &&
+      batch.lastError === nextLastError
+    ) {
+      return batch;
+    }
+    const now = new Date().toISOString();
+    const next: ExportBatchRecord = {
+      ...batch,
+      status: payload.status,
+      successCount: nextSuccessCount,
+      failedCount: nextFailedCount,
+      lastError: nextLastError,
+      syncedAt: now,
+      updatedAt: now,
+    };
+    this.exportBatches.set(payload.batchId, next);
+    return next;
   }
 
   resetFlight(): FlightInfo {

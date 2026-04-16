@@ -33,6 +33,11 @@ export interface ExportBatchRecord {
   filePath: string;
   checksum: string;
   createdAt: string;
+  updatedAt: string;
+  syncedAt?: string;
+  successCount?: number;
+  failedCount?: number;
+  lastError?: string;
 }
 
 export interface FlightInfo {
