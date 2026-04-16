@@ -4,6 +4,7 @@ import path from "node:path";
 import type {
   ExportBatchRecord,
   FlightInfo,
+  MemberSyncExportPayload,
   PointLogRecord,
   PointReasonRule,
   PointsCaps,
@@ -89,11 +90,13 @@ export class InMemoryStore {
   private readonly usersByDeviceFp = new Map<string, string>();
   private readonly rooms = new Map<string, RoomRecord>();
   private readonly exportBatches = new Map<string, ExportBatchRecord>();
+  private readonly exportPayloads = new Map<string, MemberSyncExportPayload>();
   private readonly rateLimitBuckets = new Map<string, RateBucket>();
   private readonly pointLogs = new Map<string, PointLogRecord>();
   private readonly pointDedup = new Map<string, string>();
   private readonly pointsRules: PointsRulesSnapshot;
   private readonly pointReasons: Map<string, PointReasonRule>;
+  private readonly pointsPerMile: number;
 
   private flightInfo: FlightInfo = {
     id: "flight-default",
@@ -110,6 +113,7 @@ export class InMemoryStore {
     const loaded = loadPointsRules();
     this.pointsRules = loaded.snapshot;
     this.pointReasons = loaded.reasonMap;
+    this.pointsPerMile = normalizePositiveInt(Number(process.env.POINTS_PER_MILE ?? 10), 10);
   }
 
   registerUser(payload: { deviceFp: string; nickname: string; seatNo?: string }): UserRecord {
@@ -320,6 +324,7 @@ export class InMemoryStore {
       (batch) => batch.flightId === this.flightInfo.id && batch.status === "success",
     );
     if (existing) {
+      this.ensureExportPayload(existing);
       this.flightInfo = {
         ...this.flightInfo,
         status: "exported",
@@ -339,12 +344,27 @@ export class InMemoryStore {
       createdAt,
     };
     this.exportBatches.set(batch.id, batch);
+    this.exportPayloads.set(batch.id, this.buildExportPayload(batch));
     this.flightInfo = {
       ...this.flightInfo,
       status: "exported",
       updatedAt: new Date().toISOString(),
     };
     return batch;
+  }
+
+  getExportData(batchId: string): MemberSyncExportPayload | null {
+    if (!this.exportBatches.has(batchId)) {
+      return null;
+    }
+    const payload = this.exportPayloads.get(batchId);
+    if (payload) {
+      return payload;
+    }
+    const batch = this.exportBatches.get(batchId)!;
+    const generated = this.buildExportPayload(batch);
+    this.exportPayloads.set(batchId, generated);
+    return generated;
   }
 
   resetFlight(): FlightInfo {
@@ -355,6 +375,7 @@ export class InMemoryStore {
     this.usersByDeviceFp.clear();
     this.rooms.clear();
     this.exportBatches.clear();
+    this.exportPayloads.clear();
     this.pointLogs.clear();
     this.pointDedup.clear();
     this.rateLimitBuckets.clear();
@@ -433,6 +454,63 @@ export class InMemoryStore {
       total += log.amount;
     }
     return total;
+  }
+
+  private ensureExportPayload(batch: ExportBatchRecord): void {
+    if (this.exportPayloads.has(batch.id)) {
+      return;
+    }
+    this.exportPayloads.set(batch.id, this.buildExportPayload(batch));
+  }
+
+  private buildExportPayload(batch: ExportBatchRecord): MemberSyncExportPayload {
+    const records = [...this.users.values()]
+      .filter((user) => Boolean(user.memberHash && user.memberMasked))
+      .map((user) => {
+        const details = [...this.pointLogs.values()]
+          .filter((log) => log.userId === user.id)
+          .sort((a, b) => Number(new Date(a.createdAt)) - Number(new Date(b.createdAt)))
+          .map((log) => ({
+            sessionId: log.sessionId,
+            reason: log.reason,
+            amount: log.amount,
+            createdAt: log.createdAt,
+          }));
+        const totalPoints = details.reduce((acc, detail) => acc + detail.amount, 0);
+        return {
+          mappedUserId: sha256(`${this.flightInfo.id}:${user.id}`).slice(0, 16),
+          memberMasked: user.memberMasked!,
+          memberHash: user.memberHash!,
+          totalPoints,
+          mileage: Math.floor(totalPoints / this.pointsPerMile),
+          details,
+        };
+      });
+
+    const totalPoints = records.reduce((acc, record) => acc + record.totalPoints, 0);
+    const totalMileage = records.reduce((acc, record) => acc + record.mileage, 0);
+    return {
+      batchId: batch.id,
+      flight: {
+        id: this.flightInfo.id,
+        flightNo: this.flightInfo.flightNo,
+        date: this.flightInfo.date,
+        departure: this.flightInfo.departure,
+        arrival: this.flightInfo.arrival,
+      },
+      rules: {
+        pointsPerMile: this.pointsPerMile,
+        ruleVersion: this.pointsRules.version,
+      },
+      summary: {
+        totalUsers: records.length,
+        totalPoints,
+        totalMileage,
+        skippedUsers: this.users.size - records.length,
+      },
+      records,
+      generatedAt: batch.createdAt,
+    };
   }
 }
 

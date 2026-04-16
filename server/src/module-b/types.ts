@@ -77,3 +77,42 @@ export interface PointLogRecord {
   capped: boolean;
   createdAt: string;
 }
+
+export interface MemberSyncDetailRecord {
+  sessionId: string;
+  reason: string;
+  amount: number;
+  createdAt: string;
+}
+
+export interface MemberSyncExportRecord {
+  mappedUserId: string;
+  memberMasked: string;
+  memberHash: string;
+  totalPoints: number;
+  mileage: number;
+  details: MemberSyncDetailRecord[];
+}
+
+export interface MemberSyncExportPayload {
+  batchId: string;
+  flight: {
+    id: string;
+    flightNo: string;
+    date: string;
+    departure: string;
+    arrival: string;
+  };
+  rules: {
+    pointsPerMile: number;
+    ruleVersion: string;
+  };
+  summary: {
+    totalUsers: number;
+    totalPoints: number;
+    totalMileage: number;
+    skippedUsers: number;
+  };
+  records: MemberSyncExportRecord[];
+  generatedAt: string;
+}

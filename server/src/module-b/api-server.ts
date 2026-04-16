@@ -352,6 +352,19 @@ async function handleRequest(
     return;
   }
 
+  if (method === "GET" && path === "/api/v1/admin/flight/export/data") {
+    const batchId = url.searchParams.get("batchId");
+    if (!batchId || batchId.trim().length === 0) {
+      throw new ValidationError("batchId is required");
+    }
+    const payload = store.getExportData(batchId);
+    if (!payload) {
+      throw new NotFoundError("EXPORT_BATCH_NOT_FOUND", "EXPORT_BATCH_NOT_FOUND");
+    }
+    writeJson(res, 200, { data: payload, requestId: authContext.requestId });
+    return;
+  }
+
   if (method === "POST" && path === "/api/v1/admin/flight/reset") {
     try {
       writeJson(res, 200, { data: store.resetFlight(), requestId: authContext.requestId });

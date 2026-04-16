@@ -321,6 +321,129 @@ test("航后 reset 会清理航班内缓存数据，避免跨航班残留", asyn
   });
 });
 
+test("航后导出后可按 batchId 查询会员同步数据", async () => {
+  await withApiServer(async (baseUrl) => {
+    const adminToken = "dev_admin";
+    const init = await jsonRequest<{ data: { status: string } }>(baseUrl, "/api/v1/admin/flight/init", {
+      method: "POST",
+      token: adminToken,
+      body: {
+        id: "flight-member-sync-001",
+        flightNo: "MU3002",
+        date: "2026-04-16",
+        departure: "SHA",
+        arrival: "CTU",
+      },
+    });
+    assert.equal(init.status, 200);
+    assert.equal(init.body.data.status, "active");
+
+    const boundUser = await jsonRequest<{ data: { id: string } }>(baseUrl, "/api/v1/user/register", {
+      method: "POST",
+      body: { deviceFp: "member-sync-bound", nickname: "bound-user" },
+    });
+    const unboundUser = await jsonRequest<{ data: { id: string } }>(baseUrl, "/api/v1/user/register", {
+      method: "POST",
+      body: { deviceFp: "member-sync-unbound", nickname: "unbound-user" },
+    });
+    const boundUserId = boundUser.body.data.id;
+    const unboundUserId = unboundUser.body.data.id;
+
+    const boundToken = `dev_${boundUserId}`;
+    const unboundToken = `dev_${unboundUserId}`;
+
+    const bound = await jsonRequest<{ data: { points: number } }>(baseUrl, "/api/v1/user/bind-member", {
+      method: "POST",
+      token: boundToken,
+      body: { memberNo: "MU55667788" },
+    });
+    assert.equal(bound.status, 200);
+    assert.equal(bound.body.data.points > 0, true);
+
+    const boundSettle = await jsonRequest<{ data: { points: number } }>(baseUrl, "/api/v1/points/settle", {
+      method: "POST",
+      token: boundToken,
+      body: {
+        sessionId: "member-sync-session-1",
+        reason: "GAME_WIN",
+      },
+    });
+    assert.equal(boundSettle.status, 200);
+    assert.equal(boundSettle.body.data.points > 0, true);
+
+    const unboundSettle = await jsonRequest<{ data: { points: number } }>(baseUrl, "/api/v1/points/settle", {
+      method: "POST",
+      token: unboundToken,
+      body: {
+        sessionId: "member-sync-session-2",
+        reason: "GAME_PLAY",
+      },
+    });
+    assert.equal(unboundSettle.status, 200);
+    assert.equal(unboundSettle.body.data.points > 0, true);
+
+    const complete = await jsonRequest<{ data: { status: string } }>(baseUrl, "/api/v1/admin/flight/complete", {
+      method: "POST",
+      token: adminToken,
+    });
+    assert.equal(complete.status, 200);
+    assert.equal(complete.body.data.status, "completed");
+
+    const exported = await jsonRequest<{ data: { id: string } }>(baseUrl, "/api/v1/admin/flight/export", {
+      token: adminToken,
+    });
+    assert.equal(exported.status, 200);
+    const batchId = exported.body.data.id;
+    assert.equal(typeof batchId, "string");
+
+    const exportData = await jsonRequest<{
+      data: {
+        batchId: string;
+        flight: { id: string; flightNo: string };
+        rules: { pointsPerMile: number; ruleVersion: string };
+        summary: { totalUsers: number; totalPoints: number; totalMileage: number; skippedUsers: number };
+        records: Array<{
+          mappedUserId: string;
+          memberMasked: string;
+          memberHash: string;
+          totalPoints: number;
+          mileage: number;
+          details: Array<{ sessionId: string; reason: string; amount: number }>;
+        }>;
+      };
+    }>(baseUrl, `/api/v1/admin/flight/export/data?batchId=${batchId}`, {
+      token: adminToken,
+    });
+    assert.equal(exportData.status, 200);
+    assert.equal(exportData.body.data.batchId, batchId);
+    assert.equal(exportData.body.data.flight.id, "flight-member-sync-001");
+    assert.equal(exportData.body.data.flight.flightNo, "MU3002");
+    assert.equal(exportData.body.data.rules.pointsPerMile > 0, true);
+    assert.equal(typeof exportData.body.data.rules.ruleVersion, "string");
+    assert.equal(exportData.body.data.summary.totalUsers, 1);
+    assert.equal(exportData.body.data.summary.skippedUsers, 1);
+    assert.equal(exportData.body.data.summary.totalPoints > 0, true);
+    assert.equal(exportData.body.data.summary.totalMileage >= 0, true);
+    assert.equal(exportData.body.data.records.length, 1);
+
+    const first = exportData.body.data.records[0];
+    assert.equal(Boolean(first), true);
+    assert.notEqual(first?.mappedUserId, boundUserId);
+    assert.equal(first?.memberMasked.startsWith("MU"), true);
+    assert.equal(typeof first?.memberHash, "string");
+    assert.equal((first?.memberHash.length ?? 0) > 10, true);
+    assert.equal((first?.totalPoints ?? 0) > 0, true);
+    assert.equal((first?.details.length ?? 0) > 0, true);
+    assert.equal(first?.details.some((detail) => detail.sessionId.startsWith("member-bind:")), true);
+
+    const missing = await jsonRequest<{ code: string }>(baseUrl, "/api/v1/admin/flight/export/data?batchId=missing", {
+      token: adminToken,
+    });
+    assert.equal(missing.status, 404);
+    assert.equal(missing.body.code, "EXPORT_BATCH_NOT_FOUND");
+  });
+});
+
 test("非法 JSON 返回标准错误体", async () => {
   await withApiServer(async (baseUrl) => {
     const response = await jsonRequest<{ code: string; requestId: string }>(baseUrl, "/api/v1/user/register", {
